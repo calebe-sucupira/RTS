@@ -49,6 +49,8 @@
 #define configMAX_PRIORITIES                    32
 #define configMINIMAL_STACK_SIZE                ( configSTACK_DEPTH_TYPE ) 256
 #define configUSE_16_BIT_TICKS                  0
+#define configUSE_TASK_NOTIFICATIONS            1
+#define configTASK_NOTIFICATION_ARRAY_ENTRIES   1
 
 #define configIDLE_SHOULD_YIELD                 1
 
