@@ -4,31 +4,36 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
+#include "queue.h"
 #include <stdio.h>
 #include "servo.h"
-#include "queue.h"
 
-#define SERVO_PIN 12
+// Definições dos pinos
+#define SERVO_PIN 16
 #define TRIG_PIN 10
 #define ECHO_PIN 11
-#define PWM_FREQUENCY 1000
-#define PIN_MOTOR_LEFT  2 
-#define PIN_MOTOR_RIGHT 3  
-
-// Estruturas globais e variáveis
-servo_t myServo;
-uint8_t current_servo_angle;
-uint slice_num_left;
-uint slice_num_right;
+#define PIN_MOTOR_LEFT  2
+#define PIN_MOTOR_RIGHT 3
 
 #define QUEUE_SIZE 180
 QueueHandle_t distanceQueue;
 
-// Handles para as tarefas
-TaskHandle_t servoTaskHandle = NULL;
-TaskHandle_t sensorTaskHandle = NULL;
-TaskHandle_t decisionTaskHandle = NULL;
+// Declarações das funções
+void setup_sensor(void);
+void move_servo(uint8_t angle);
+void check_for_obstacle(void);
 
+servo_t myServo;
+
+// Variáveis Globais
+TaskHandle_t moveTaskHandle = NULL;
+TaskHandle_t scanTaskHandle = NULL;
+TaskHandle_t decisionTaskHandle = NULL;
+TaskHandle_t measureTaskHandle = NULL;
+
+uint8_t current_servo_angle = 0;
+bool obstacle_detected = false;
+float last_distance = 100.0;  // Variável global para armazenar a última distância lida
 
 // Função para configurar os pinos do sensor
 void setup_sensor() {
@@ -43,136 +48,181 @@ void setup_sensor() {
     gpio_set_dir(PIN_MOTOR_RIGHT, GPIO_OUT);
 }
 
-
-// Tarefa responsável por mover o servo motor em uma varredura de 180 graus
-void vTaskServo() {
-    uint8_t angle = 0;
-    int8_t step = 4;  // Controla o sentido de movimento do servo
-
-    while (1) {
-        printf("Movendo servo para o ângulo: %d\n", angle);
-        current_servo_angle = angle;
-        // Mover o servo
-        servoWrite(&myServo, angle);
-
-        // Notificar a tarefa de sensor para realizar a leitura
-        xTaskNotifyGive(sensorTaskHandle);
-        vTaskDelay(pdMS_TO_TICKS(25));
-
-        // Atualizar o ângulo do servo
-        angle += step;
-
-        // Inverter o sentido quando atingir os limites de 0 ou 180 graus
-        if (angle >= 180 || angle <= 0) {
-            step = -step;
-        }
-
-        // Aguardar a notificação para sincronizar com a tarefa do sensor
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+// Função para verificar se há um obstáculo
+void check_for_obstacle() {
+    if (last_distance < 20.0) {  // Supondo que um obstáculo está a menos de 30 cm
+        obstacle_detected = true;
+    } else {
+        obstacle_detected = false;
     }
 }
 
-// Tarefa responsável por coletar a distância medida pelo sensor ultrassônico
-void vTaskSensor() {
+// Nova tarefa para medir a distância
+void vTaskMeasureDistance(void *pvParameters) {
     uint32_t start_time, end_time, pulse_duration;
-    float distance_cm;
-
     while (1) {
-        // Esperar a notificação da tarefa de servo
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        // Disparo do pulso
+        printf("Verificando se tem obstaculo\n");
+        // Enviar pulso de trigger
         gpio_put(TRIG_PIN, 0);
         sleep_us(2);
         gpio_put(TRIG_PIN, 1);
         sleep_us(10);
         gpio_put(TRIG_PIN, 0);
 
-        // Esperar o início do pulso no ECHO
-        while (gpio_get(ECHO_PIN) == 0);
-        start_time = time_us_32();
-
-        // Esperar o final do pulso no ECHO
-        while (gpio_get(ECHO_PIN) == 1);
-        end_time = time_us_32();
-
-        // Calcular a duração do pulso e a distância
-        pulse_duration = end_time - start_time;
-        distance_cm = (pulse_duration * 0.034) / 2;
-
-        // Enviar o valor da distância para a fila
-        if (xQueueSend(distanceQueue, &distance_cm, 10) != pdTRUE) {
-            printf("Fila cheia. Não foi possível enviar a distância.\n");
+       // Espera o pino ECHO subir (início do pulso de resposta)
+        uint32_t timeout = 20000;  // Timeout de segurança
+        while (gpio_get(ECHO_PIN) == 0 && timeout > 0) {
+            timeout--;
+            sleep_us(1);
         }
 
-        // Notificar a tarefa de decisão
-        xTaskNotifyGive(decisionTaskHandle);
+        if (timeout == 0) {
+            printf("Erro: Timeout ao esperar o início do pulso de ECHO\n");
+            last_distance = 400.0;  // Marca como falha
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;  // Pula para a próxima iteração sem tentar medir
+        }
+
+        // Registrar o tempo de início
+        start_time = time_us_32();
+
+        // Espera o pino ECHO cair (fim do pulso de resposta)
+        timeout = 20000;  // Timeout ajustado para o tempo máximo de resposta
+        while (gpio_get(ECHO_PIN) == 1 && timeout > 0) {
+            timeout--;
+            sleep_us(1);
+        }
+
+        if (timeout == 0) {
+            printf("Erro: Timeout ao esperar o fim do pulso de ECHO\n");
+            last_distance = 400.0;  // Marca como falha
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        // Registrar o tempo de fim
+        end_time = time_us_32();
+
+        // Calcula a duração do pulso
+        pulse_duration = end_time - start_time;
+
+        // Verifica se o valor faz sentido antes de calcular a distância
+        if (pulse_duration > 0) {
+            last_distance = (pulse_duration * 0.034) / 2;  // Distância em cm
+            printf("Distância medida: %.2f cm\n", last_distance);
+        } else {
+            printf("Erro: Duração do pulso inválida\n");
+            last_distance = 400;
+        }
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
-// Tarefa responsável por controlar o carrinho
-void vTaskDecision() {
-    float distance_cm;
-    bool obstacle = false;
-    bool obstacle_right = false;
-    bool obstacle_left = false;
+// Tarefa para mover o carrinho para frente
+void vTaskMove(void *pvParameters) {
+    while (1) {
+        // Verificar se há um obstáculo
+        servoWrite(&myServo, 90);
+        check_for_obstacle();
+
+        // Movimentar o carrinho para frente
+        gpio_put(PIN_MOTOR_LEFT, 1);
+        gpio_put(PIN_MOTOR_RIGHT, 1);
+
+        // Checar se obstáculo foi detectado
+        if (obstacle_detected) {
+            // Parar o carrinho
+            gpio_put(PIN_MOTOR_LEFT, 0);
+            gpio_put(PIN_MOTOR_RIGHT, 0);
+            printf("Obstáculo detectado, parando o carrinho...\n");
+
+            // Notificar a tarefa de varredura
+            xTaskNotifyGive(scanTaskHandle);
+
+            // Suspender a tarefa de movimentação até a decisão ser tomada
+            vTaskSuspend(NULL);
+        }
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
+// Tarefa para realizar a varredura com o servo motor
+void vTaskScan(void *pvParameters) {
+    uint8_t angle = 0;
+    float distance;
 
     while (1) {
-        // Esperar a notificação da tarefa do sensor
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        // Receber o valor da distância da fila
-        if (xQueueReceive(distanceQueue, &distance_cm, 10) == pdTRUE) {
-            printf("Distância: %.2f cm\n", distance_cm);
-
-            // Verifica se o obstáculo está à frente (ângulo entre 88º e 92º)
-            if (current_servo_angle >= 88 && current_servo_angle <= 92) {
-                obstacle = distance_cm <= 50.0;
-            }
-
-             // Se houver um obstáculo à frente, verificar lados
-            if (obstacle) {
-                obstacle_right = (current_servo_angle < 88 && distance_cm <= 50.0);
-                obstacle_left  = (current_servo_angle > 92 && distance_cm <= 50.0);
-            } else {
-                obstacle_right = false;
-                obstacle_left  = false;
-            }
-
-            // Tomar decisões com base nos obstáculos
-            if (obstacle_right && obstacle_left) {
-                printf("Pare\n");
-                gpio_put(PIN_MOTOR_LEFT, 0);
-                gpio_put(PIN_MOTOR_RIGHT, 0);
-            } else if (obstacle_right) {
-                printf("Vire à esquerda\n");
-                gpio_put(PIN_MOTOR_LEFT, 0);
-                gpio_put(PIN_MOTOR_RIGHT, true);
-            } else if (obstacle_left) {
-                printf("Vire à direita\n");
-                gpio_put(PIN_MOTOR_LEFT, true);
-                gpio_put(PIN_MOTOR_RIGHT, 0);
-            } else {
-                printf("Continue\n");
-               gpio_put(PIN_MOTOR_LEFT, true);
-               gpio_put(PIN_MOTOR_RIGHT, true);
-            }
-        } else {
-            printf("Erro ao receber da fila\n");
+        if(!obstacle_detected){
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         }
 
-        // Sincronizar com a próxima execução
-        xTaskNotifyGive(servoTaskHandle);
+        servoWrite(&myServo, angle);
+        vTaskDelay(pdMS_TO_TICKS(25));
+        distance = last_distance;  // Usar a distância lida pela tarefa de medição
+        angle++;
+        if (xQueueSend(distanceQueue, &distance, pdMS_TO_TICKS(10)) != pdTRUE) {
+            printf("Erro ao enviar distância para a fila.\n");
+        }
+        if(angle == 180){
+            angle = 0;
+            xTaskNotifyGive(decisionTaskHandle);
+        }
+    }
+}
+
+// Tarefa para tomar a decisão sobre o caminho a seguir
+void vTaskDecision(void *pvParameters) {
+    float distance;
+    float left_distance = 9999, right_distance = 9999;
+    uint8_t scan_count = 0;
+
+    while (1) {
+
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+
+        // Processar as distâncias da fila
+        while (xQueueReceive(distanceQueue, &distance, 0) == pdTRUE) {
+            if (right_distance > distance && scan_count <= 90) {
+                right_distance = distance;
+            } else if(left_distance > distance){
+                left_distance = distance;  // Somar as distâncias da esquerda (90-180 graus)
+            }
+            scan_count++;
+        }
+        // Tomar decisão
+        if (right_distance > left_distance) {
+            printf("Virar à direita.\n");
+            // Lógica para virar à direita
+            gpio_put(PIN_MOTOR_LEFT, 1);
+            gpio_put(PIN_MOTOR_RIGHT, 0);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        } else {
+            printf("Virar à esquerda.\n");
+            // Lógica para virar à esquerda
+            gpio_put(PIN_MOTOR_LEFT, 0);
+            gpio_put(PIN_MOTOR_RIGHT, 1);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        // Retornar o controle para a tarefa de movimentação
+        obstacle_detected = false;
+        vTaskResume(moveTaskHandle);
+
+        // Resetar as variáveis
+        left_distance = 9999;
+        right_distance = 9999;
+        scan_count = 0;
     }
 }
 
 int main() {
     stdio_init_all();
     setup_sensor();
-    servoAttach(&myServo, SERVO_PIN);
-    
 
-    // Criação da fila
+    servoAttach(&myServo, SERVO_PIN);
+    servoWrite(&myServo, 90);
+    // Criação da fila de distâncias
     distanceQueue = xQueueCreate(QUEUE_SIZE, sizeof(float));
     if (distanceQueue == NULL) {
         printf("Erro ao criar a fila.\n");
@@ -180,15 +230,17 @@ int main() {
     }
 
     // Criação das tarefas
-    xTaskCreate(vTaskServo, "Servo Task", 256, NULL, 1, &servoTaskHandle);
-    xTaskCreate(vTaskSensor, "Sensor Task", 256, NULL, 1, &sensorTaskHandle);
+    xTaskCreate(vTaskMove, "Move Task", 256, NULL, 2, &moveTaskHandle);
+    xTaskCreate(vTaskScan, "Scan Task", 256, NULL, 1, &scanTaskHandle);
     xTaskCreate(vTaskDecision, "Decision Task", 256, NULL, 1, &decisionTaskHandle);
+    xTaskCreate(vTaskMeasureDistance, "Measure Task", 256, NULL, 3, &measureTaskHandle);  // Nova tarefa de medição
 
-    gpio_put(PIN_MOTOR_LEFT, true);
-    gpio_put(PIN_MOTOR_RIGHT, true);
+    // Iniciar o agendador do FreeRTOS
     vTaskStartScheduler();
 
-    while (1) {}
+    while (1) {
+        // O código não deve chegar aqui
+    }
 
     return 0;
 }
