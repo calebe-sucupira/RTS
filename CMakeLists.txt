@@ -1,27 +1,51 @@
 cmake_minimum_required(VERSION 3.13)
 
-# Pull in SDK (must be before project)
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+include(
+    $ENV{FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_import.cmake
+)
 
-# Pull in FreeRTOS
-include($ENV{FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_import.cmake)
+project(pico_freertos_cart C CXX ASM)
 
-project(app C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
-# Initialize the SDK
 pico_sdk_init()
 
-add_executable(Task src/servo.c src/main.c)
+add_executable(
+    pico_freertos_cart
+    src/main.c
+    src/app_tasks.c
+    src/motor_driver.c
+    src/servo.c
+    src/ultrasonic.c
+)
 
-target_include_directories(Task PRIVATE ${CMAKE_CURRENT_LIST_DIR})
- 
-# pull in common dependencies
-target_link_libraries(Task pico_stdlib FreeRTOS-Kernel FreeRTOS-Kernel-Heap4 hardware_pwm)
+target_include_directories(
+    pico_freertos_cart
+    PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_LIST_DIR}/inc
+)
 
-pico_enable_stdio_usb(Task 1)
-pico_enable_stdio_uart(Task 0)
+target_link_libraries(
+    pico_freertos_cart
+    PRIVATE
+        pico_stdlib
+        hardware_clocks
+        hardware_gpio
+        hardware_pwm
+        FreeRTOS-Kernel
+        FreeRTOS-Kernel-Heap4
+)
 
-# create map/bin/hex/uf2 file etc.
-pico_add_extra_outputs(Task)
+target_compile_options(
+    pico_freertos_cart
+    PRIVATE
+        -Wall
+        -Wextra
+)
+
+pico_enable_stdio_usb(pico_freertos_cart 1)
+pico_enable_stdio_uart(pico_freertos_cart 0)
+pico_add_extra_outputs(pico_freertos_cart)
